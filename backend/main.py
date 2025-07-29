@@ -118,9 +118,12 @@ async def health_check():
     """Проверка здоровья API"""
     return {"status": "healthy", "timestamp": "2024-01-01T00:00:00Z"}
 
+# Пути для сохранения файлов
 TELETHON_SESSION_DIR = "telegram_sessions"
-MEDIA_DOWNLOAD_DIR = "telegram_media"
-LLM_EXPORT_DIR = "llm_exports"
+MEDIA_DOWNLOAD_DIR = "telegram_media"  # В корне проекта
+LLM_EXPORT_DIR = "llm_exports"  # В папке backend
+
+# Создаём папки
 os.makedirs(TELETHON_SESSION_DIR, exist_ok=True)
 os.makedirs(MEDIA_DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(LLM_EXPORT_DIR, exist_ok=True)
@@ -128,8 +131,9 @@ os.makedirs(LLM_EXPORT_DIR, exist_ok=True)
 # Удаляем TELETHON_CLIENTS, TWOFA_PENDING, PHONE_CODE_HASHES
 PHONE_CODE_HASHES = {}
 
-# Глобальная переменная для отслеживания статуса скачивания
+# Глобальные переменные для отслеживания статуса
 DOWNLOAD_STATUS = {}
+EXPORT_STATUS = {}
 
 def get_session_path(api_id, phone):
     """Создаём уникальное имя сессии на основе api_id и phone"""
@@ -217,12 +221,8 @@ def get_media_path(chat_id, chat_title):
 async def download_media_file(client, message, media_path, file_type):
     """Скачивает медиафайл и возвращает информацию о нём"""
     try:
-        # Убеждаемся, что папка существует
         os.makedirs(media_path, exist_ok=True)
-        
-        # Форматируем дату для названия файла
         date_str = message.date.strftime("%Y%m%d_%H%M%S")
-        
         if file_type == "voice" and message.voice:
             file_path = os.path.join(media_path, f"voice_{date_str}_{message.id}.ogg")
             if not os.path.exists(file_path):
@@ -258,19 +258,27 @@ async def download_media_file(client, message, media_path, file_type):
                 "date": str(message.date),
                 "mime_type": message.document.mime_type
             }
+        elif file_type == "photo" and message.photo:
+            file_path = os.path.join(media_path, f"photo_{date_str}_{message.id}.jpg")
+            if not os.path.exists(file_path):
+                await client.download_media(message.photo, file_path)
+            return {
+                "id": message.id,
+                "type": "photo",
+                "file_path": file_path,
+                "date": str(message.date),
+                "width": getattr(message.photo, 'width', None),
+                "height": getattr(message.photo, 'height', None)
+            }
         elif file_type == "text" and message.text:
-            # Сохраняем текстовые сообщения в JSON файл
-            text_file = os.path.join(media_path, f"text_{date_str}_{message.id}.json")
+            text_file = os.path.join(media_path, f"text_{date_str}_{message.id}.txt")
             if not os.path.exists(text_file):
-                text_data = {
-                    "id": message.id,
-                    "type": "text",
-                    "text": message.text,
-                    "date": str(message.date),
-                    "sender_id": message.sender_id
-                }
                 with open(text_file, 'w', encoding='utf-8') as f:
-                    json.dump(text_data, f, indent=2, ensure_ascii=False)
+                    f.write(f"ID: {message.id}\n")
+                    f.write(f"Дата: {message.date}\n")
+                    f.write(f"Отправитель: {message.sender_id}\n")
+                    f.write(f"Текст:\n{message.text}\n")
+                    f.write("-" * 50 + "\n")
             return {
                 "id": message.id,
                 "type": "text",
@@ -491,6 +499,14 @@ async def get_download_status(chat_id: int):
         return DOWNLOAD_STATUS[status_key]
     return {"status": "not_found"}
 
+@app.get("/telegram/export-status/{chat_id}")
+async def get_export_status(chat_id: int):
+    """Получить статус экспорта LLM для чата"""
+    status_key = f"export_{chat_id}"
+    if status_key in EXPORT_STATUS:
+        return EXPORT_STATUS[status_key]
+    return {"status": "not_found"}
+
 @app.post("/telegram/chat/{chat_id}/download")
 async def download_chat_media(chat_id: int, data: TelegramDownloadRequest, download_voice: bool = True, download_video: bool = True):
     """Скачивает медиафайлы из чата"""
@@ -548,6 +564,7 @@ async def download_chat_media(chat_id: int, data: TelegramDownloadRequest, downl
         text_count = 0
         voice_count = 0
         video_count = 0
+        photo_count = 0
         
         async for message in client.iter_messages(chat_id):
             processed_messages += 1
@@ -560,7 +577,8 @@ async def download_chat_media(chat_id: int, data: TelegramDownloadRequest, downl
                     "progress": progress,
                     "text_count": text_count,
                     "voice_count": voice_count,
-                    "video_count": video_count
+                    "video_count": video_count,
+                    "photo_count": photo_count
                 })
                 print(f"⏳ Обработано сообщений: {processed_messages}/{total_messages}")
             
@@ -595,11 +613,23 @@ async def download_chat_media(chat_id: int, data: TelegramDownloadRequest, downl
                         file_size = os.path.getsize(file_info['file_path'])
                         total_size_mb += file_size / (1024 * 1024)
                     print(f"🎥 Скачан видео файл: {message.id}")
+            
+            # Скачиваем фотографии (всегда)
+            if message.photo:
+                photo_count += 1
+                file_info = await download_media_file(client, message, media_path, "photo")
+                if file_info:
+                    downloaded_files.append(file_info)
+                    if os.path.exists(file_info['file_path']):
+                        file_size = os.path.getsize(file_info['file_path'])
+                        total_size_mb += file_size / (1024 * 1024)
+                    print(f"🖼️ Скачана фотография: {message.id}")
         
         print(f"✅ Обработка завершена:")
         print(f"   • Текстовых: {text_count}")
         print(f"   • Голосовых: {voice_count}")
         print(f"   • Видео: {video_count}")
+        print(f"   • Фото: {photo_count}")
         print(f"   • Общий размер: {round(total_size_mb, 2)} МБ")
         
         # Создаём отдельный файл с текстовыми сообщениями
@@ -611,17 +641,45 @@ async def download_chat_media(chat_id: int, data: TelegramDownloadRequest, downl
             if file_info['type'] == 'text':
                 try:
                     with open(file_info['file_path'], 'r', encoding='utf-8') as f:
-                        text_data = json.load(f)
-                    timestamp = text_data['date'].replace('T', ' ').split('.')[0]
-                    date_part = timestamp.split(' ')[0]
-                    time_part = timestamp.split(' ')[1]
+                        content = f.read()
                     
-                    # Добавляем разделитель даты
-                    if current_date != date_part:
-                        current_date = date_part
-                        text_messages.append(f"\n📅 {date_part}")
+                    # Парсим информацию из файла
+                    lines = content.split('\n')
+                    message_id = None
+                    date_str = None
+                    text_content = ""
                     
-                    text_messages.append(f"[{time_part}] Сообщение {text_data['id']}: {text_data['text']}")
+                    for line in lines:
+                        if line.startswith('ID: '):
+                            message_id = line.replace('ID: ', '').strip()
+                        elif line.startswith('Дата: '):
+                            date_str = line.replace('Дата: ', '').strip()
+                        elif line.startswith('Текст:'):
+                            # Находим текст после "Текст:"
+                            text_start = content.find('Текст:') + 6
+                            text_end = content.find('-' * 50)
+                            if text_end == -1:
+                                text_end = len(content)
+                            text_content = content[text_start:text_end].strip()
+                            break
+                    
+                    if date_str and text_content:
+                        # Парсим дату
+                        try:
+                            date_obj = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                            date_part = date_obj.strftime('%Y-%m-%d')
+                            time_part = date_obj.strftime('%H:%M:%S')
+                            
+                            # Добавляем разделитель даты
+                            if current_date != date_part:
+                                current_date = date_part
+                                text_messages.append(f"\n📅 {date_part}")
+                            
+                            text_messages.append(f"[{time_part}] Сообщение {message_id}: {text_content}")
+                        except Exception as e:
+                            print(f"❌ Ошибка парсинга даты {date_str}: {e}")
+                            text_messages.append(f"[Неизвестное время] Сообщение {message_id}: {text_content}")
+                    
                 except Exception as e:
                     print(f"❌ Ошибка чтения текстового файла {file_info['file_path']}: {e}")
         
@@ -786,6 +844,19 @@ async def transcribe_audio(audio_path):
 async def export_chat_for_llm(client, chat_id, limit=1000):
     """Экспортирует чат в формате для LLM"""
     try:
+        # Инициализируем статус экспорта
+        status_key = f"export_{chat_id}"
+        EXPORT_STATUS[status_key] = {
+            "status": "exporting",
+            "processed": 0,
+            "total": 0,
+            "text_count": 0,
+            "voice_count": 0,
+            "video_count": 0,
+            "photo_count": 0,
+            "document_count": 0
+        }
+        
         # Получаем информацию о чате
         chat = await client.get_entity(chat_id)
         chat_title = getattr(chat, 'title', None) or getattr(chat, 'first_name', 'Unknown')
@@ -802,15 +873,34 @@ async def export_chat_for_llm(client, chat_id, limit=1000):
         processed_count = 0
         total_size_mb = 0
         downloaded_files = 0
+        text_count = 0
+        voice_count = 0
+        video_count = 0
+        photo_count = 0
+        document_count = 0
         
         # Сначала подсчитаем общее количество сообщений
         total_messages = 0
         async for _ in client.iter_messages(chat_id, limit=limit):
             total_messages += 1
         
+        # Обновляем статус
+        EXPORT_STATUS[status_key]["total"] = total_messages
+        
         # Получаем сообщения
         async for message in client.iter_messages(chat_id, limit=limit):
             processed_count += 1
+            
+            # Обновляем статус каждые 10 сообщений
+            if processed_count % 10 == 0:
+                EXPORT_STATUS[status_key].update({
+                    "processed": processed_count,
+                    "text_count": text_count,
+                    "voice_count": voice_count,
+                    "video_count": video_count,
+                    "photo_count": photo_count,
+                    "document_count": document_count
+                })
             
             # Определяем отправителя
             if message.from_id:
@@ -833,6 +923,7 @@ async def export_chat_for_llm(client, chat_id, limit=1000):
             
             # Обрабатываем разные типы сообщений
             if message.text:
+                text_count += 1
                 msg_data.update({
                     "type": "text",
                     "text": message.text
@@ -856,6 +947,7 @@ async def export_chat_for_llm(client, chat_id, limit=1000):
                 # Расшифровываем аудио
                 transcription = await transcribe_audio(voice_path)
                 
+                voice_count += 1
                 msg_data.update({
                     "type": "voice",
                     "file": voice_file,
@@ -878,6 +970,7 @@ async def export_chat_for_llm(client, chat_id, limit=1000):
                         total_size_mb += file_size / (1024 * 1024)
                         downloaded_files += 1
                 
+                video_count += 1
                 msg_data.update({
                     "type": "video",
                     "file": video_file,
@@ -887,6 +980,7 @@ async def export_chat_for_llm(client, chat_id, limit=1000):
                 messages.append(msg_data)
                 
             elif message.photo:
+                photo_count += 1
                 # Скачиваем фото
                 date_str = message.date.strftime("%Y-%m-%d_%H-%M-%S")
                 photo_file = f"photo_{date_str}_{message.id}.jpg"
@@ -908,6 +1002,7 @@ async def export_chat_for_llm(client, chat_id, limit=1000):
                 messages.append(msg_data)
                 
             elif message.document:
+                document_count += 1
                 # Скачиваем документ
                 date_str = message.date.strftime("%Y-%m-%d_%H-%M-%S")
                 doc_name = getattr(message.document, 'attributes', [{}])[0].get('file_name', f'document_{message.id}')
@@ -968,6 +1063,18 @@ async def export_chat_for_llm(client, chat_id, limit=1000):
         with open(text_only_file, 'w', encoding='utf-8') as f:
             f.write('\n'.join(text_messages))
         
+        # Обновляем финальный статус
+        EXPORT_STATUS[status_key] = {
+            "status": "completed",
+            "processed": processed_count,
+            "total": total_messages,
+            "text_count": text_count,
+            "voice_count": voice_count,
+            "video_count": video_count,
+            "photo_count": photo_count,
+            "document_count": document_count
+        }
+        
         # Создаём метаданные
         metadata = {
             "chat_id": chat_id,
@@ -1001,6 +1108,11 @@ async def export_chat_for_llm(client, chat_id, limit=1000):
         
     except Exception as e:
         print(f"Ошибка экспорта чата: {e}")
+        # Обновляем статус ошибки
+        EXPORT_STATUS[status_key] = {
+            "status": "error",
+            "error": str(e)
+        }
         return {"status": "error", "detail": str(e)}
 
 @app.post("/telegram/chat/{chat_id}/export-llm")
@@ -1060,4 +1172,4 @@ async def list_llm_exports():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    uvicorn.run(app, host="0.0.0.0", port=8001) 
